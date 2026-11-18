@@ -1,1 +1,1 @@
-{"description":"Simple notes web app","engines":{"node":">=18"},"main":"index.js","name":"notes-app","private":true,"scripts":{"start":"node index.js"},"version":"1.0.0"}
+{"description":"notes web service","engines":{"node":">=18"},"main":"index.js","name":"notes-web","private":true,"scripts":{"start":"node index.js"},"version":"1.0.0"}
