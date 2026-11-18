@@ -1,0 +1,1 @@
+{"description":"A small personal notes web app with realtime sync","engines":{"node":">=18"},"main":"index.js","name":"notes-app","private":true,"scripts":{"start":"node index.js"},"version":"1.0.0"}
