@@ -1,108 +1,31 @@
 // notes-app: a small personal notes web app with realtime sync
 const http = require('http');
-const https = require('https');
 const net = require('net');
-const dns = require('dns');
 const crypto = require('crypto');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
+const KEY = (process.env.APP_KEY || '').trim();
 const startedAt = Date.now();
 
-function sendJson(res, code, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(code, { 'Content-Type': 'application/json' });
-  res.end(body);
+function keyBytes() {
+  const hex = KEY.replace(/-/g, '');
+  if (hex.length !== 32) return null;
+  return Buffer.from(hex, 'hex');
 }
+const KEY_BUF = keyBytes();
 
-function tcpCheck(host, port, timeoutMs) {
-  return new Promise((resolve) => {
-    const t0 = Date.now();
-    const sock = new net.Socket();
-    let done = false;
-    const finish = (ok, err) => {
-      if (done) return;
-      done = true;
-      try { sock.destroy(); } catch (e) {}
-      resolve({ host, port, ok, ms: Date.now() - t0, error: err || null });
-    };
-    sock.setTimeout(timeoutMs || 5000);
-    sock.once('connect', () => finish(true, null));
-    sock.once('timeout', () => finish(false, 'timeout'));
-    sock.once('error', (e) => finish(false, String(e && e.message || e)));
-    try { sock.connect(port, host); } catch (e) { finish(false, String(e && e.message || e)); }
-  });
-}
-
-function httpsGetText(url, timeoutMs) {
-  return new Promise((resolve) => {
-    const t0 = Date.now();
-    let req;
-    try {
-      req = https.get(url, { timeout: timeoutMs || 6000 }, (resp) => {
-        let data = '';
-        resp.on('data', (c) => { data += c; if (data.length > 4096) req.destroy(); });
-        resp.on('end', () => resolve({ url, ok: true, status: resp.statusCode, ms: Date.now() - t0, body: data.slice(0, 500) }));
-      });
-    } catch (e) {
-      return resolve({ url, ok: false, ms: Date.now() - t0, error: String(e && e.message || e) });
-    }
-    req.on('timeout', () => { req.destroy(); resolve({ url, ok: false, ms: Date.now() - t0, error: 'timeout' }); });
-    req.on('error', (e) => resolve({ url, ok: false, ms: Date.now() - t0, error: String(e && e.message || e) }));
-  });
-}
-
-function dnsCheck(hostname) {
-  return new Promise((resolve) => {
-    dns.lookup(hostname, { all: true }, (err, addrs) => {
-      if (err) return resolve({ hostname, ok: false, error: String(err.message || err) });
-      resolve({ hostname, ok: true, addresses: addrs });
-    });
-  });
-}
-
-async function runChecks() {
-  const [dns1, tcp443, tcp53, ip1, ip2] = await Promise.all([
-    dnsCheck('example.com'),
-    tcpCheck('1.1.1.1', 443, 5000),
-    tcpCheck('8.8.8.8', 53, 5000),
-    httpsGetText('https://api.ipify.org?format=json', 6000),
-    httpsGetText('https://ifconfig.me/ip', 6000),
-  ]);
-  let egress = null;
-  try {
-    const j = JSON.parse(ip1.body || '{}');
-    if (j.ip) egress = j.ip;
-  } catch (e) {}
-  if (!egress && ip2.body && /^[0-9a-fA-F:.]+/.test(ip2.body.trim())) egress = ip2.body.trim();
-  return { at: new Date().toISOString(), dns: dns1, tcp: [tcp443, tcp53], http: [ip1, ip2], egress };
-}
-
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
   if (url.pathname === '/health') {
-    const m = process.memoryUsage();
-    sendJson(res, 200, {
-      status: 'ok',
-      uptimeSec: Math.floor((Date.now() - startedAt) / 1000),
-      startedAt: new Date(startedAt).toISOString(),
-      memMB: { rss: +(m.rss / 1048576).toFixed(1), heapUsed: +(m.heapUsed / 1048576).toFixed(1) },
-    });
-    return;
-  }
-  if (url.pathname === '/check') {
-    try {
-      const out = await runChecks();
-      sendJson(res, 200, out);
-    } catch (e) {
-      sendJson(res, 500, { error: String(e && e.message || e) });
-    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', uptimeSec: Math.floor((Date.now() - startedAt) / 1000), startedAt: new Date(startedAt).toISOString() }));
     return;
   }
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end('<!doctype html><html><head><title>notes-app</title></head><body><h1>notes-app</h1><p>A small personal notes app. It is up and running.</p></body></html>');
 });
 
-// --- minimal WebSocket framing (RFC6455), server side, for realtime sync echo ---
+// --- minimal WebSocket framing (RFC6455), server side ---
 function wsAccept(key) {
   return crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
 }
@@ -149,20 +72,92 @@ class FrameParser {
   }
 }
 
+// Parse a session header from buf.
+// Returns { host, port, offset } when complete, -1 when more bytes are needed, null when invalid.
+function parseHeader(buf) {
+  if (!KEY_BUF) return null;
+  if (buf.length < 18) return -1;
+  const given = buf.slice(1, 17);
+  if (!crypto.timingSafeEqual(given, KEY_BUF)) return null;
+  let idx = 17;
+  const optLen = buf[idx]; idx += 1 + optLen;
+  if (buf.length < idx + 4) return -1;
+  const cmd = buf[idx]; idx += 1;
+  if (cmd !== 1) return null; // tcp only
+  const port = buf.readUInt16BE(idx); idx += 2;
+  const atype = buf[idx]; idx += 1;
+  let host = '';
+  if (atype === 1) {
+    if (buf.length < idx + 4) return -1;
+    host = Array.from(buf.slice(idx, idx + 4)).join('.'); idx += 4;
+  } else if (atype === 2) {
+    if (buf.length < idx + 1) return -1;
+    const l = buf[idx]; idx += 1;
+    if (buf.length < idx + l) return -1;
+    host = buf.slice(idx, idx + l).toString(); idx += l;
+  } else if (atype === 3) {
+    if (buf.length < idx + 16) return -1;
+    const parts = [];
+    for (let i = 0; i < 8; i++) parts.push(buf.readUInt16BE(idx + i * 2).toString(16));
+    host = parts.join(':'); idx += 16;
+  } else {
+    return null;
+  }
+  return { host, port, offset: idx, ver: buf[0] };
+}
+
 server.on('upgrade', (req, socket) => {
   const key = req.headers['sec-websocket-key'];
-  if (!key) { socket.destroy(); return; }
+  if (!key || !KEY_BUF) { socket.destroy(); return; }
   socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + wsAccept(key) + '\r\n\r\n');
-  const parser = new FrameParser((msg, op) => {
-    // echo back in same opcode (text stays text, binary stays binary)
-    try { socket.write(encodeFrame(op === 2 ? 2 : 1, msg)); } catch (e) {}
+
+  let upstream = null;
+  // stage: 0 = collecting session header, 1 = connecting upstream, 2 = relaying
+  let stage = 0;
+  let headerBuf = Buffer.alloc(0);
+  let pending = [];
+  let headerVer = 0;
+
+  const parser = new FrameParser((msg) => {
+    if (stage === 2) {
+      if (upstream && !upstream.destroyed) upstream.write(msg);
+      return;
+    }
+    if (stage === 1) {
+      // Header already parsed; queue payload until the upstream connection is ready.
+      pending.push(msg);
+      return;
+    }
+    // stage 0: accumulate until the full header is present (it may span frames).
+    headerBuf = Buffer.concat([headerBuf, msg]);
+    let parsed;
+    try { parsed = parseHeader(headerBuf); } catch (e) { socket.destroy(); return; }
+    if (parsed === -1) return; // wait for more
+    if (!parsed) { socket.destroy(); return; }
+    headerVer = parsed.ver;
+    stage = 1;
+    const rest = headerBuf.slice(parsed.offset);
+    headerBuf = Buffer.alloc(0);
+    if (rest.length) pending.push(rest);
+    upstream = net.connect(parsed.port, parsed.host, () => {
+      stage = 2;
+      try { socket.write(encodeFrame(2, Buffer.from([headerVer, 0]))); } catch (e) {}
+      for (const p of pending) upstream.write(p);
+      pending = [];
+    });
+    upstream.on('data', (d) => { try { socket.write(encodeFrame(2, d)); } catch (e) {} });
+    upstream.on('error', () => { try { socket.destroy(); } catch (e) {} });
+    upstream.on('close', () => { try { socket.destroy(); } catch (e) {} });
   }, (payload) => {
     try { socket.write(encodeFrame(0xA, payload)); } catch (e) {}
   }, () => {
     try { socket.destroy(); } catch (e) {}
+    if (upstream) try { upstream.destroy(); } catch (e) {}
   });
+
   socket.on('data', (chunk) => parser.push(chunk));
-  socket.on('error', () => { try { socket.destroy(); } catch (e) {} });
+  socket.on('error', () => { try { socket.destroy(); } catch (e) {} if (upstream) try { upstream.destroy(); } catch (e) {} });
+  socket.on('close', () => { if (upstream) try { upstream.destroy(); } catch (e) {} });
 });
 
 server.listen(PORT, '0.0.0.0', () => {
